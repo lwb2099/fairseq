@@ -77,6 +77,7 @@ class TransformerEncoderLayerBase(nn.Module):
             nn.Linear(input_dim, output_dim), p=q_noise, block_size=qn_block_size
         )
 
+    # Adaprune
     def _get_fc_rank(self, remove_num: int) -> List[int]:
         f1_filter_param = []
         for i in range(self.fc1.out_features):
@@ -89,6 +90,7 @@ class TransformerEncoderLayerBase(nn.Module):
             range(len(f1_filter_param)), key=lambda k: f1_filter_param[k], reverse=False
         )[0:remove_num]
 
+    # Adaprune
     def _prune_fc_layer(self, remove_index: List[int]):
         new_fc1_weight = []
         new_fc1_bias = []

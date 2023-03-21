@@ -185,6 +185,7 @@ class MultiheadAttention(FairseqIncrementalDecoder):
         if self.bias_v is not None:
             nn.init.xavier_normal_(self.bias_v)
 
+    # Adaprune
     def _get_reserve_head_index(self, num_heads_to_keep: int):
         k_proj_heads_norm = []
         q_proj_heads_norm = []

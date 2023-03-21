@@ -30,7 +30,6 @@ from fairseq.nan_detector import NanDetector
 from fairseq.optim import lr_scheduler
 from fairseq.utils import safe_hasattr
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -52,6 +51,7 @@ class Trainer(object):
             )
             cfg = convert_namespace_to_omegaconf(cfg)
 
+        # 配置信息和task信息
         self.cfg = cfg
         self.task = task
 
@@ -66,6 +66,7 @@ class Trainer(object):
         else:
             self.device = torch.device("cpu")
 
+        # Fully shared data parallel
         if self.is_fsdp:
             import fairscale
 
@@ -74,30 +75,32 @@ class Trainer(object):
                     "FullyShardedDataParallel is not compatible with --bf16 or "
                     "--memory-efficient-bf16"
                 )
+            # ZeRO sharding, 已经集成到fsdp中了，不需要指定
             if self.cfg.distributed_training.zero_sharding != "none":
                 raise ValueError(
                     "FullyShardedDataParallel is not compatible with --zero-sharding "
                     "option (it's already built in)"
                 )
             if (
-                max(self.cfg.optimization.update_freq) > 1
-                and fairscale.__version__ < "0.4.0"
+                    max(self.cfg.optimization.update_freq) > 1
+                    and fairscale.__version__ < "0.4.0"
             ):
                 raise RuntimeError(
                     "Please update to fairscale 0.4.0 or newer when combining "
                     "--update-freq with FullyShardedDataParallel"
                 )
-        else:
+        else:  # 不采用fsdp
             if (
-                hasattr(self.cfg.distributed_training, "cpu_offload")
-                and self.cfg.distributed_training.cpu_offload
-            ):
+                    hasattr(self.cfg.distributed_training, "cpu_offload")
+                    and self.cfg.distributed_training.cpu_offload
+            ):  # 只有fsdp中才能用cpu_offload（不用的时候把grads等参数放到cpu中暂存，减少缓存压力但是速度减慢）
                 raise ValueError("--cpu-offload requires --ddp-backend=fully_sharded")
 
         # copy model and criterion to current device/dtype
         self._criterion = criterion
         self._model = model
         if not self.is_fsdp:
+            #  AMP：自动混合精度
             if cfg.common.fp16:
                 assert not cfg.common.amp, "Cannot use fp16 and AMP together"
                 self._criterion = self._criterion.half()
@@ -105,24 +108,29 @@ class Trainer(object):
             elif cfg.common.bf16:
                 self._criterion = self._criterion.to(dtype=torch.bfloat16)
                 self._model = self._model.to(dtype=torch.bfloat16)
+            # 混合精度
             elif cfg.common.amp:
                 self._amp_retries = 0
         if (
-            not cfg.distributed_training.pipeline_model_parallel
-            # the DistributedFairseqModel wrapper will handle moving to device,
-            # so only handle cases which don't use the wrapper
-            and not self.use_distributed_wrapper
+                not cfg.distributed_training.pipeline_model_parallel
+                # the DistributedFairseqModel wrapper will handle moving to device,
+                # so only handle cases which don't use the wrapper
+                and not self.use_distributed_wrapper
         ):
+            # 不用分布式
             self._criterion = self._criterion.to(device=self.device)
             self._model = self._model.to(device=self.device)
+            # pipeline_model_parallel: if set, use pipeline model parallelism across GPUs
+        # model 并行，将模型分隔成不同块，放在不同GPU上
         self.pipeline_model_parallel = cfg.distributed_training.pipeline_model_parallel
-        self.last_device = None
+        self.last_device = None  # 最后一张GPU
         if self.cuda and self.pipeline_model_parallel:
             self.last_device = torch.device(
                 cfg.distributed_training.pipeline_devices[-1]
             )
 
         # check that shared parameters are preserved after device transfer
+        # 检查share params的正确性
         for shared_param in shared_params:
             ref = _get_module_by_path(self._model, shared_param[0])
             for path in shared_param[1:]:
@@ -131,16 +139,17 @@ class Trainer(object):
                 )
                 _set_module_by_path(self._model, path, ref)
 
+        # 设置一系列参数
         self._dummy_batch = None  # indicates we don't have a dummy batch at first
         self._lr_scheduler = None
         self._num_updates = 0
         self._num_xla_compiles = 0  # for TPUs
-        self._optim_history = None
+        self._optim_history = None  # 优化历史(不知道干啥？？？)
         self._optimizer = None
         self._warn_once = set()
         self._wrapped_criterion = None
         self._wrapped_model = None
-        self._ema = None
+        self._ema = None  # 指数移动平均（Exponential Moving Average）/权重移动平均（Weighted Moving Average）
 
         # TODO(myleott): support tpu
         if self.cuda and self.data_parallel_world_size > 1:
@@ -161,12 +170,13 @@ class Trainer(object):
                 )
             else:
                 self.cuda_env_arr = [self.cuda_env]
-            if self.data_parallel_rank == 0:
+            if self.data_parallel_rank == 0:  # 只在master上打印
                 utils.CudaEnvironment.pretty_print_cuda_env_list(self.cuda_env_arr)
         else:
             self.cuda_env = None
             self.cuda_env_arr = None
 
+        # 集合了各种log的东西
         metrics.log_start_time("wall", priority=790, round=0)
 
         self._start_time = time.time()
@@ -180,39 +190,44 @@ class Trainer(object):
         self._wrapped_criterion = None
         self._wrapped_model = None
 
+    # 总进程数
     @property
     def data_parallel_world_size(self):
         if self.cfg.distributed_training.distributed_world_size == 1:
             return 1
         return distributed_utils.get_data_parallel_world_size()
 
+    # 进程组
     @property
     def data_parallel_process_group(self):
         return distributed_utils.get_data_parallel_group()
 
+    # 几号GPU
     @property
     def data_parallel_rank(self):
         if self.cfg.distributed_training.distributed_world_size == 1:
             return 0
         return distributed_utils.get_data_parallel_rank()
 
+    # 是否为master节点
     @property
     def is_data_parallel_master(self):
         # NOTE: this returns true for all model parallel replicas with data
         # parallel rank 0
         return self.data_parallel_rank == 0
 
+    # 不太明白？？？
     @property
     def use_distributed_wrapper(self) -> bool:
-        return (
-            self.data_parallel_world_size > 1 and not self.cfg.optimization.use_bmuf
-        ) or (self.is_fsdp and self.cfg.distributed_training.cpu_offload)
+        return (  # use_bmuf: specify global optimizer for syncing models on different GPUs/shards
+                       self.data_parallel_world_size > 1 and not self.cfg.optimization.use_bmuf
+               ) or (self.is_fsdp and self.cfg.distributed_training.cpu_offload)
 
     @property
     def should_save_checkpoint_on_current_rank(self) -> bool:
         """Indicates whether to save checkpoints on the current DDP rank."""
         if (
-            self.is_fsdp and self.cfg.distributed_training.use_sharded_state
+                self.is_fsdp and self.cfg.distributed_training.use_sharded_state
         ) or getattr(self.cfg.model, "base_layers", 0) > 0:
             return True
         else:
@@ -241,7 +256,7 @@ class Trainer(object):
         if self._wrapped_criterion is None:
             if utils.has_parameters(self._criterion) and self.use_distributed_wrapper:
                 self._wrapped_criterion = models.DistributedFairseqModel(
-                    self.cfg.distributed_training,
+                    self.cfg.distributed_training,  # 分布式训练的设置
                     self._criterion,
                     process_group=self.data_parallel_process_group,
                     device=self.device,
@@ -252,6 +267,7 @@ class Trainer(object):
 
     @property
     def model(self):
+        # ？？？
         if self._wrapped_model is None:
             if self.use_distributed_wrapper:
                 self._wrapped_model = models.DistributedFairseqModel(
@@ -270,6 +286,7 @@ class Trainer(object):
             self._build_ema()
         return self._ema
 
+    # 指数移动平均（Exponential Moving Average）/ 权重移动平均（Weighted Moving Average）
     def _build_ema(self):
         if self.cfg.ema.store_ema:
             self._ema = build_ema(self._model, self.cfg.ema, self.device)
@@ -288,6 +305,7 @@ class Trainer(object):
         return self._lr_scheduler
 
     def _build_optimizer(self):
+        # 获取需要更新梯度的参数
         params = list(
             filter(
                 lambda p: p.requires_grad,
@@ -301,6 +319,7 @@ class Trainer(object):
             # --memory-efficient-fp16 flag set, then we're effectively doing
             # regular --fp16 and can allow the use of optimizers that would
             # otherwise be unsupported by MemoryEfficientFP16Optimizer.
+            # 如果没有set --memory-efficient-fp16, 就用普通的--fp16
             allow_unsupported = not self.cfg.common.memory_efficient_fp16
             self._optimizer = optim.MemoryEfficientFP16Optimizer.build_optimizer(
                 self.cfg, params, allow_unsupported=allow_unsupported
@@ -312,8 +331,8 @@ class Trainer(object):
                     "please switch to FP32 which is likely to be faster"
                 )
             if (
-                self.cfg.common.memory_efficient_fp16
-                or self.cfg.common.memory_efficient_bf16
+                    self.cfg.common.memory_efficient_fp16
+                    or self.cfg.common.memory_efficient_bf16
             ):
                 self._optimizer = optim.MemoryEfficientFP16Optimizer.build_optimizer(
                     self.cfg, params
@@ -329,6 +348,7 @@ class Trainer(object):
                 )
             self._optimizer = optim.build_optimizer(self.cfg.optimizer, params)
 
+        # fsdp 和 BMUF, non-pointwise optimizer 不兼容
         if self.is_fsdp:
             assert (
                 not self.cfg.optimization.use_bmuf
@@ -346,11 +366,12 @@ class Trainer(object):
                 self._optimizer,
             )
 
+        # 没懂？？？
         if self.cfg.distributed_training.zero_sharding == "os":
             if (
-                self.cfg.common.fp16
-                and not self.cfg.common.memory_efficient_fp16
-                and not self.cfg.common.memory_efficient_bf16
+                    self.cfg.common.fp16
+                    and not self.cfg.common.memory_efficient_fp16
+                    and not self.cfg.common.memory_efficient_bf16
             ) and not self.cfg.common.fp16_no_flatten_grads:
                 raise ValueError(
                     "ZeRO is incomptabile with fp16 and flattened grads. "
@@ -361,11 +382,13 @@ class Trainer(object):
 
         # We should initialize the learning rate scheduler immediately after
         # building the optimizer, so that the initial learning rate is set.
+        # 设置optimizer的时候就要设置好lr
         self._lr_scheduler = lr_scheduler.build_lr_scheduler(
             self.cfg.lr_scheduler,
             self.optimizer,
         )
-        self._lr_scheduler.step_update(0)
+        # lr 的 一种策略(吧
+        self._lr_scheduler.step_update(0)  # num_updates=0,
 
     @property
     def is_fsdp(self):
@@ -384,6 +407,7 @@ class Trainer(object):
             )  # only returns on rank 0
             self._gathered_optim_state = st
 
+    # 模型参数
     def state_dict(self):
         state_dict = {
             "args": None,  # legacy
@@ -399,20 +423,21 @@ class Trainer(object):
                 else None
             ),
             "optimizer_history": (self._optim_history or [])
-            + [
-                {
-                    "criterion_name": self.get_criterion().__class__.__name__,
-                    "optimizer_name": self.optimizer.__class__.__name__,
-                    "lr_scheduler_state": self.lr_scheduler.state_dict(),
-                    "num_updates": self.get_num_updates(),
-                }
-            ],
+                                 + [
+                                     {
+                                         "criterion_name": self.get_criterion().__class__.__name__,
+                                         "optimizer_name": self.optimizer.__class__.__name__,
+                                         "lr_scheduler_state": self.lr_scheduler.state_dict(),
+                                         "num_updates": self.get_num_updates(),
+                                     }
+                                 ],
             "task_state": self.task.state_dict() if self.task is not None else {},
             "extra_state": {
-                "metrics": metrics.state_dict(),
+                "metrics": metrics.state_dict(),  # 精度的参数
                 "previous_training_time": self.cumulative_training_time(),
             },
         }
+        # 指数移动平均（Exponential Moving Average）/ 权重移动平均（Weighted Moving Average）
         if self.cfg.ema.store_ema:
             # Save EMA model state as extra state
             state_dict["extra_state"]["ema"] = self.ema.get_model().state_dict()
@@ -437,6 +462,7 @@ class Trainer(object):
         # call state_dict on all ranks in case it needs internal communication
         state_dict = utils.move_to_cpu(self.state_dict())
         state_dict["extra_state"].update(extra_state)
+        # 本机需要保存
         if self.should_save_checkpoint_on_current_rank:
             checkpoint_utils.torch_persistent_save(
                 state_dict,
@@ -445,13 +471,15 @@ class Trainer(object):
             )
         logger.info(f"Finished saving checkpoint to {os.path.abspath(filename)}")
 
+    # master(rank==0) 从文件load_ckp, 然后广播到其他进程
+    # return extra_state
     def load_checkpoint(
-        self,
-        filename,
-        reset_optimizer=False,
-        reset_lr_scheduler=False,
-        optimizer_overrides=None,
-        reset_meters=False,
+            self,
+            filename,
+            reset_optimizer=False,  # reset_optimizer参数为True，则重新初始化优化器参数，若reset_optimizer参数为False，则从路径中恢复优化器参数
+            reset_lr_scheduler=False,
+            optimizer_overrides=None,
+            reset_meters=False,
     ):
         """
         Load all training state from a checkpoint file.
@@ -463,37 +491,41 @@ class Trainer(object):
         logger.info(f"Preparing to load checkpoint {filename}")
         is_distributed = self.data_parallel_world_size > 1
         bexists = PathManager.isfile(filename)
-        if bexists:
+        if bexists:  # 文件存在
             load_on_all_ranks = (
-                self.cfg.checkpoint.load_checkpoint_on_all_dp_ranks
-                # TPUs don't support broadcast yet, so load checkpoints
-                # on every worker for now
-                or self.tpu
-                # FSDP requires loading checkpoint shards on all ranks
-                or (self.is_fsdp and self.cfg.distributed_training.use_sharded_state)
-                or getattr(self.cfg.model, "base_layers", 0) > 0
+                    self.cfg.checkpoint.load_checkpoint_on_all_dp_ranks
+                    # TPUs don't support broadcast yet, so load checkpoints
+                    # on every worker for now
+                    or self.tpu
+                    # FSDP requires loading checkpoint shards on all ranks
+                    or (self.is_fsdp and self.cfg.distributed_training.use_sharded_state)
+                    or getattr(self.cfg.model, "base_layers", 0) > 0  # 这一点没看懂？？？
             )
 
+            # 都要load或者单进程
             if load_on_all_ranks or self.data_parallel_rank == 0:
                 state = checkpoint_utils.load_checkpoint_to_cpu(
                     filename, load_on_all_ranks=load_on_all_ranks
                 )
+                # 获取上一次更新的state
                 last_optim_state = state.get("last_optimizer_state", None)
 
                 # If doing zero_sharding, do not broadcast global optimizer
                 # state. Later we will broadcast sharded states to each rank
                 # to avoid memory from exploding.
+                # fsdp中不要广播global optimizer，之后广播(为了避免在load的时候广播导致memory爆炸)
                 if (
-                    not load_on_all_ranks
-                    and self.cfg.distributed_training.zero_sharding == "os"
-                    and "last_optimizer_state" in state
-                    and is_distributed
+                        not load_on_all_ranks
+                        and self.cfg.distributed_training.zero_sharding == "os"
+                        and "last_optimizer_state" in state
+                        and is_distributed
                 ):
                     state["last_optimizer_state"] = "SHARDED"
             else:
                 last_optim_state = None
                 state = None
 
+            # 多进程，但是不用都load
             if is_distributed and not load_on_all_ranks:
                 state = distributed_utils.broadcast_object(
                     state,
@@ -507,10 +539,11 @@ class Trainer(object):
             # load model parameters
             try:
                 if (
-                    "optimizer_history" in state
-                    and len(state["optimizer_history"]) > 0
-                    and "num_updates" in state["optimizer_history"][-1]
+                        "optimizer_history" in state
+                        and len(state["optimizer_history"]) > 0
+                        and "num_updates" in state["optimizer_history"][-1]
                 ):
+                    # 设置模型已经更新了的次数，取出最后一次更新的信息
                     self.model.set_num_updates(
                         state["optimizer_history"][-1]["num_updates"]
                     )
@@ -525,9 +558,9 @@ class Trainer(object):
                 # User will fine tune the the new roberta encoder via the ckpt saved above
                 # To get rid of registering different pruned version of Roberta, I use the argument --mha-heads-to-keep to prune the Roberta model into a pruned version which matches the pruned ckpt.
                 if (
-                    safe_hasattr(self.model, "args")
-                    and safe_hasattr(self.model.args, "mha_heads_to_keep")
-                    and self.model.args.mha_heads_to_keep != -1
+                        safe_hasattr(self.model, "args")
+                        and safe_hasattr(self.model.args, "mha_heads_to_keep")
+                        and self.model.args.mha_heads_to_keep != -1
                 ):
                     logger.info(
                         f"Prune model: keep {self.model.args.mha_heads_to_keep} heads for each multihead attention module"
@@ -551,9 +584,9 @@ class Trainer(object):
                 # User will fine tune the the new roberta encoder via the ckpt saved above
                 # To get rid of registering different pruned version of Roberta, I use the argument --ffn-blocks-to-remove to prune the Roberta model into a pruned version which matches the pruned ckpt.
                 if (
-                    safe_hasattr(self.model, "args")
-                    and safe_hasattr(self.model.args, "ffn_blocks_to_remove")
-                    and self.model.args.ffn_blocks_to_remove != -1
+                        safe_hasattr(self.model, "args")
+                        and safe_hasattr(self.model.args, "ffn_blocks_to_remove")
+                        and self.model.args.ffn_blocks_to_remove != -1
                 ):
                     logger.info(
                         f"Prune model: remove {self.model.args.ffn_blocks_to_remove} ffn blocks for each transformer layer"
@@ -564,7 +597,8 @@ class Trainer(object):
                         )
                         layer._prune_fc_layer(remove_index=remove_index)
                     logger.info(self.model)
-
+                # 如果函数接受的参数strict是True,那么state_dict的关键字必须确切地严格地和
+                # 该模块的state_dict()函数返回的关键字相匹配
                 self.model.load_state_dict(
                     state["model"], strict=True, model_cfg=self.cfg.model
                 )
@@ -584,28 +618,33 @@ class Trainer(object):
             extra_state = state["extra_state"]
             self._optim_history = state["optimizer_history"]
 
+        # 有上次更新的信息且不需要重新设置优化器的参数
         if last_optim_state is not None and not reset_optimizer:
             # rebuild optimizer after loading model, since params may have changed
+            # 为什么可能change？？？
             self._build_optimizer()
 
             # only reload optimizer and lr_scheduler if they match
             last_optim = self._optim_history[-1]
             assert (
-                last_optim["criterion_name"] == self.get_criterion().__class__.__name__
+                    last_optim["criterion_name"] == self.get_criterion().__class__.__name__
             ), f"Criterion does not match; please reset the optimizer (--reset-optimizer). {last_optim['criterion_name']} vs {self.get_criterion().__class__.__name__}"
             assert (
-                last_optim["optimizer_name"] == self.optimizer.__class__.__name__
+                    last_optim["optimizer_name"] == self.optimizer.__class__.__name__
             ), f"Optimizer does not match; please reset the optimizer (--reset-optimizer). {last_optim['optimizer_name']} vs {self.optimizer.__class__.__name__}"
 
+            # 不需要重新设置lr的策略
             if not reset_lr_scheduler:
                 self.lr_scheduler.load_state_dict(last_optim["lr_scheduler_state"])
 
+            # 如果shard state：则last-optim的state已经sharded？？？
             if self.is_fsdp and not self.model.use_sharded_state:
                 # if use_sharded_state, the last_optim_state is already sharded, skip this
                 last_optim_state = self.model.get_shard_from_optim_state_dict(
                     last_optim_state
                 )
             elif not load_on_all_ranks and is_distributed:
+                # Broadcasts a global state dict to all ranks
                 last_optim_state = self.optimizer.broadcast_global_state_dict(
                     last_optim_state
                 )
@@ -614,6 +653,7 @@ class Trainer(object):
 
             self.set_num_updates(last_optim["num_updates"])
 
+        # 记录extra-state
         if extra_state is not None:
             itr_state = extra_state["train_iterator"]
             epoch = itr_state["epoch"]
@@ -622,11 +662,12 @@ class Trainer(object):
                 self._previous_training_time = extra_state["previous_training_time"]
                 self._start_time = time.time()
 
+            # Adjust the learning rate at the end of the epoch
             self.lr_step(epoch)
 
             if (
-                itr_state.get("version", 1) >= 2
-                and itr_state["iterations_in_epoch"] == 0
+                    itr_state.get("version", 1) >= 2
+                    and itr_state["iterations_in_epoch"] == 0
             ):
                 # reset meters at start of epoch
                 reset_meters = True
@@ -674,13 +715,13 @@ class Trainer(object):
         return extra_state
 
     def get_train_iterator(
-        self,
-        epoch,
-        combine=True,
-        load_dataset=True,
-        data_selector=None,
-        shard_batch_itr=True,
-        disable_iterator_cache=False,
+            self,
+            epoch,
+            combine=True,
+            load_dataset=True,
+            data_selector=None,
+            shard_batch_itr=True,
+            disable_iterator_cache=False,
     ):
         """Return an EpochBatchIterator over the training set for a given epoch."""
         if load_dataset:
@@ -692,11 +733,14 @@ class Trainer(object):
                 data_selector=data_selector,
                 tpu=self.tpu,
             )
+        # Get an iterator that yields batches of data from the given dataset
+        # for details，see：tasks/fairseq_task.py
         batch_iterator = self.task.get_batch_iterator(
             dataset=self.task.dataset(self.cfg.dataset.train_subset),
             max_tokens=self.cfg.dataset.max_tokens,
             max_sentences=self.cfg.dataset.batch_size,
-            max_positions=utils.resolve_max_positions(
+            # max sentence len
+            max_positions=utils.resolve_max_positions(  # Resolve max position constraints from multiple sources.
                 self.task.max_positions(),
                 self.model.max_positions(),
                 self.cfg.dataset.max_tokens,
@@ -704,6 +748,7 @@ class Trainer(object):
             ignore_invalid_inputs=True,
             required_batch_size_multiple=self.cfg.dataset.required_batch_size_multiple,
             seed=(self.cfg.common.seed + epoch)
+            # if true then increment seed with epoch for getting batch iterators
             if self.cfg.dataset.update_ordered_indices_seed
             else self.cfg.common.seed,
             num_shards=self.data_parallel_world_size if shard_batch_itr else 1,
@@ -720,9 +765,9 @@ class Trainer(object):
         return batch_iterator
 
     def get_valid_iterator(
-        self,
-        subset,
-        disable_iterator_cache=False,
+            self,
+            subset,
+            disable_iterator_cache=False,
     ):
         """Return an EpochBatchIterator over given validation subset for a given epoch."""
         batch_iterator = self.task.get_batch_iterator(
@@ -753,6 +798,7 @@ class Trainer(object):
         """Called at the beginning of each epoch."""
         logger.info("begin training epoch {}".format(epoch))
 
+        # Adjust the learning rate at the beginning of the epoch
         self.lr_step_begin_epoch(epoch)
 
         if self.quantizer is not None:
@@ -793,7 +839,7 @@ class Trainer(object):
         if self.cfg.ema.store_ema and getattr(self.task, "uses_ema", False):
             extra_kwargs["ema_model"] = self.ema.get_model()
 
-        # forward and backward pass
+        """====================forward and backward pass===================="""
         logging_outputs, sample_size, ooms = [], 0, 0
         for i, sample in enumerate(samples):  # delayed update loop
             sample, is_dummy_batch = self._prepare_sample(sample)
@@ -804,15 +850,17 @@ class Trainer(object):
                 want to accumulate gradients locally and only call
                 all-reduce in the last backwards pass.
                 """
+                # 前K-1次取消梯度同步，最后一次再all reduce
+                # 由于完整的梯度在local更新(为啥不是部分) ？？？
                 if (
-                    self.data_parallel_world_size > 1
-                    and hasattr(self.model, "no_sync")
-                    and i < len(samples) - 1
-                    # The no_sync context manager results in increased memory
-                    # usage with FSDP, since full-size gradients will be
-                    # accumulated on each GPU. It's typically a better tradeoff
-                    # to do the extra communication with FSDP.
-                    and not self.is_fsdp
+                        self.data_parallel_world_size > 1
+                        and hasattr(self.model, "no_sync")
+                        and i < len(samples) - 1
+                        # The no_sync context manager results in increased memory
+                        # usage with FSDP, since full-size gradients will be
+                        # accumulated on each GPU. It's typically a better tradeoff
+                        # to do the extra communication with FSDP.
+                        and not self.is_fsdp
                 ):
                     return self.model.no_sync()
                 else:
@@ -841,6 +889,7 @@ class Trainer(object):
                     torch.cuda.empty_cache()
             except RuntimeError as e:
                 if "out of memory" in str(e):
+                    # report / recover oom
                     self._log_oom(e)
                     if raise_oom:
                         raise e
@@ -870,6 +919,8 @@ class Trainer(object):
                 # mark step here for every forward pass without a backward pass
                 self._xla_markstep_and_send_to_cpu()
 
+        # sample_size转float / 清零
+        # 不清楚dummy_batch是什么鬼
         if is_dummy_batch:
             if torch.is_tensor(sample_size):
                 sample_size.zero_()
@@ -894,11 +945,13 @@ class Trainer(object):
             ) = self._aggregate_logging_outputs(
                 logging_outputs, sample_size, ooms, train_time, ignore=is_dummy_batch
             )
+            # 和上面那个training time的区别？？？
             self._cumulative_training_time = (
-                total_train_time / self.data_parallel_world_size
+                    total_train_time / self.data_parallel_world_size
             )
 
         overflow = False
+        """=======================an optimize step==========================="""
         try:
             with torch.autograd.profiler.record_function("reduce-grads"):
                 # reduce gradients across workers
@@ -929,12 +982,12 @@ class Trainer(object):
                 # clip grads
                 grad_norm = self.clip_grad_norm(self.cfg.optimization.clip_norm)
 
-            # check that grad norms are consistent across workers
+            """check that grad norms are consistent across workers"""
             # on tpu check tensor is slow
             if not self.tpu:
                 if (
-                    not self.cfg.optimization.use_bmuf
-                    and self.cfg.distributed_training.ddp_backend != "slowmo"
+                        not self.cfg.optimization.use_bmuf
+                        and self.cfg.distributed_training.ddp_backend != "slowmo"
                 ):
                     self._check_grad_norms(grad_norm)
                 if not torch.isfinite(grad_norm).all():
@@ -947,7 +1000,7 @@ class Trainer(object):
                         raise FloatingPointError("gradients are Nan/Inf")
 
             with torch.autograd.profiler.record_function("optimizer"):
-                # take an optimization step
+                """take an optimization step"""
                 self.task.optimizer_step(
                     self.optimizer, model=self.model, update_num=self.get_num_updates()
                 )
@@ -962,14 +1015,14 @@ class Trainer(object):
                         )  # recursion to feed in same batch
 
         except FloatingPointError:
-
+            # 保存模型
             self.consolidate_optimizer()
             self.save_checkpoint(
                 os.path.join(self.cfg.checkpoint.save_dir, "crash.pt"), {}
             )
 
-            # re-run the forward and backward pass with hooks attached to print
-            # out where it fails
+            """ re-run the forward and backward pass with hooks attached to print
+                out where it fails"""
             self.zero_grad()
             with NanDetector(self.get_model()):
                 for _, sample in enumerate(samples):
@@ -989,6 +1042,7 @@ class Trainer(object):
             logger.info(
                 f"NOTE: gradient overflow detected, ignoring gradient, {str(e)}"
             )
+            # 把梯度清零
             grad_norm = torch.tensor(0.0).cuda()
             self.zero_grad()
         except RuntimeError as e:
@@ -1003,7 +1057,7 @@ class Trainer(object):
             self.model.perform_slowmo(
                 self.optimizer.optimizer, getattr(self.optimizer, "fp32_params", None)
             )
-
+        """==============打印==============="""
         logging_output = None
         if not overflow or self.cfg.distributed_training.ddp_backend == "slowmo":
             self.set_num_updates(self.get_num_updates() + 1)
@@ -1022,6 +1076,7 @@ class Trainer(object):
                     weight=0,
                 )
 
+            """打印内存相关的信息"""
             if self.tpu:
                 import torch_xla.core.xla_model as xm
 
@@ -1070,16 +1125,17 @@ class Trainer(object):
 
                 # clear CUDA cache to reduce memory fragmentation
                 if (
-                    self.cuda
-                    and self.cfg.common.empty_cache_freq > 0
-                    and (
+                        self.cuda
+                        and self.cfg.common.empty_cache_freq > 0
+                        and (
                         (self.get_num_updates() + self.cfg.common.empty_cache_freq - 1)
                         % self.cfg.common.empty_cache_freq
-                    )
-                    == 0
+                )
+                        == 0
                 ):
                     torch.cuda.empty_cache()
 
+        """打印loss"""
         if self.cfg.common.fp16 or self.cfg.common.amp:
             metrics.log_scalar(
                 "loss_scale",
@@ -1116,7 +1172,7 @@ class Trainer(object):
             self.criterion.eval()
 
             sample, is_dummy_batch = self._prepare_sample(sample)
-
+            """======================run task.valid_step==============="""
             try:
                 _loss, sample_size, logging_output = self.task.valid_step(
                     sample, self.model, self.criterion, **extra_kwargs
@@ -1196,6 +1252,8 @@ class Trainer(object):
         """Get the (non-wrapped) criterion instance."""
         return self._criterion
 
+    """跟踪统计量的"""
+
     def get_meter(self, name):
         """[deprecated] Get a specific meter by name."""
         from fairseq import meters
@@ -1228,7 +1286,7 @@ class Trainer(object):
         elif name in {"valid_loss", "valid_nll_loss"}:
             # support for legacy train.py, which assumed these meters
             # are always initialized
-            k = name[len("valid_") :]
+            k = name[len("valid_"):]
             m = metrics.get_meter("valid", k)
             return m or meters.AverageMeter()
         elif name == "oom":
@@ -1237,6 +1295,7 @@ class Trainer(object):
             return train_meters[name]
         return None
 
+    """模型已经更新的次数"""
     def get_num_updates(self):
         """Get the number of parameters updates."""
         return self._num_updates
@@ -1245,7 +1304,7 @@ class Trainer(object):
         """Set the number of parameters updates."""
         self._num_updates = num_updates
         self.lr_step_update()
-        if self.quantizer:
+        if self.quantizer:  # 量化的东西
             self.quantizer.step_update(self._num_updates)
         metrics.log_scalar("num_updates", self._num_updates, weight=0, priority=200)
 
@@ -1255,16 +1314,17 @@ class Trainer(object):
             total_norm = distributed_utils.all_reduce(
                 total_norm, group=self.data_parallel_process_group
             )
-            return total_norm**0.5
+            return total_norm ** 0.5
 
         should_agg_norm = self.is_fsdp and (
-            self.data_parallel_process_group is not None
-            or torch.distributed.is_initialized()
+                self.data_parallel_process_group is not None
+                or torch.distributed.is_initialized()
         )
         return self.optimizer.clip_grad_norm(
             clip_norm, aggregate_norm_fn=agg_norm_fn if should_agg_norm else None
         )
 
+    """获得训练的时间"""
     def cumulative_training_time(self):
         if self._cumulative_training_time is None:
             # single GPU
@@ -1276,6 +1336,7 @@ class Trainer(object):
         """Aggregate training time in seconds."""
         return time.time() - self._start_time + self._previous_training_time
 
+    """精度从 fp32 剪到 fp16"""
     def _fp_convert_sample(self, sample):
         def apply_half(t):
             if t.dtype is torch.float32:
@@ -1287,7 +1348,7 @@ class Trainer(object):
                 return t.to(dtype=torch.bfloat16)
             return t
 
-        if self.cfg.common.fp16:
+        if self.cfg.common.fp16:  # use fp16
             sample = utils.apply_to_sample(apply_half, sample)
 
         if self.cfg.common.bf16:
@@ -1295,6 +1356,7 @@ class Trainer(object):
 
         return sample
 
+    """不明白是干嘛的？？？"""
     def _prepare_sample(self, sample, is_dummy=False):
         if sample == "DUMMY":
             raise Exception(
@@ -1305,7 +1367,7 @@ class Trainer(object):
 
         if sample is None or len(sample) == 0:
             assert (
-                self._dummy_batch is not None and len(self._dummy_batch) > 0
+                    self._dummy_batch is not None and len(self._dummy_batch) > 0
             ), "Invalid dummy batch: {}".format(self._dummy_batch)
             sample, _ = self._prepare_sample(self._dummy_batch, is_dummy=True)
             return sample, True
@@ -1314,9 +1376,11 @@ class Trainer(object):
         # it makes sense to do the format conversion on the CPU and then transfer
         # a smaller buffer to the device. This also saves GPU memory capacity.
 
+        # if set, the floating point conversion to fp16/bf16 runs on CPU. "
+        # "This reduces bus transfer time and GPU memory usage
         if self.cfg.common.on_cpu_convert_precision:
             sample = self._fp_convert_sample(sample)
-
+        # 不明白为什么要move，move了啥？？？
         if self.cuda:
             if self.pipeline_model_parallel:
                 if "target" in sample:
@@ -1343,17 +1407,18 @@ class Trainer(object):
         seed = self.cfg.common.seed + self.get_num_updates()
         utils.set_torch_seed(seed)
 
+    # 和warm up有什么关系
     def _sync_stats(self):
-        # Return True if it's using multiple GPUs and DDP or multiple GPUs with
-        # BMUF and it's a bmuf sync with warmup iterations completed before.
+        """ Return True if it's using multiple GPUs and DDP or multiple GPUs with
+        BMUF and it's a bmuf sync with warmup iterations completed before."""
         if self.data_parallel_world_size == 1:
             return False
         elif self.cfg.optimization.use_bmuf:
             return (
-                self.get_num_updates() + 1
-            ) % self.cfg.bmuf.global_sync_iter == 0 and (
-                self.get_num_updates() + 1
-            ) > self.cfg.bmuf.warmup_iterations
+                           self.get_num_updates() + 1
+                   ) % self.cfg.bmuf.global_sync_iter == 0 and (
+                           self.get_num_updates() + 1
+                   ) > self.cfg.bmuf.warmup_iterations
         else:
             return True
 
@@ -1366,11 +1431,12 @@ class Trainer(object):
         sys.stderr.flush()
 
     def _aggregate_logging_outputs(
-        self,
-        logging_outputs: List[Dict[str, Any]],
-        *extra_stats_to_sum,
-        ignore=False,
+            self,
+            logging_outputs: List[Dict[str, Any]],
+            *extra_stats_to_sum,
+            ignore=False,
     ):
+        """Sync logging outputs across workers"""
         if self.task.__class__.logging_outputs_can_be_summed(self.get_criterion()):
             return self._fast_stat_sync_sum(
                 logging_outputs, *extra_stats_to_sum, ignore=ignore
@@ -1381,10 +1447,10 @@ class Trainer(object):
             )
 
     def _all_gather_list_sync(
-        self,
-        logging_outputs: List[Dict[str, Any]],
-        *extra_stats_to_sum,
-        ignore=False,
+            self,
+            logging_outputs: List[Dict[str, Any]],
+            *extra_stats_to_sum,
+            ignore=False,
     ):
         """
         Sync logging outputs across workers. all_gather_list_sync is
@@ -1409,10 +1475,10 @@ class Trainer(object):
         return logging_outputs, extra_stats_to_sum
 
     def _fast_stat_sync_sum(
-        self,
-        logging_outputs: List[Dict[str, Any]],
-        *extra_stats_to_sum,
-        ignore=False,
+            self,
+            logging_outputs: List[Dict[str, Any]],
+            *extra_stats_to_sum,
+            ignore=False,
     ):
         """
         Sync logging outputs across workers. fast_stat_sync_sum is
@@ -1460,11 +1526,11 @@ class Trainer(object):
             def is_consistent(tensor):
                 max_abs_diff = torch.max(torch.abs(tensor - tensor[0]))
                 return (
-                    (
-                        torch.isfinite(tensor).all()
-                        and (max_abs_diff / (tensor[0] + 1e-6) < 1e-6).all()
-                    )
-                    or (self.cfg.common.amp and not torch.isfinite(tensor).all())
+                        (
+                                torch.isfinite(tensor).all()
+                                and (max_abs_diff / (tensor[0] + 1e-6) < 1e-6).all()
+                        )
+                        or (self.cfg.common.amp and not torch.isfinite(tensor).all())
                     # in case of amp non-finite grads are fine
                 )
 
@@ -1487,9 +1553,10 @@ class Trainer(object):
                     + "-" * 80
                 )
 
+    """在train/valid_step中打印信息时调用"""
     def _reduce_and_log_stats(self, logging_outputs, sample_size, grad_norm=None):
         if grad_norm is not None and (
-            not torch.is_tensor(grad_norm) or torch.isfinite(grad_norm)
+                not torch.is_tensor(grad_norm) or torch.isfinite(grad_norm)
         ):
             metrics.log_speed("ups", 1.0, priority=100, round=2)
             metrics.log_scalar("gnorm", grad_norm, priority=400, round=3)
@@ -1507,6 +1574,7 @@ class Trainer(object):
 
         with metrics.aggregate() as agg:
             if logging_outputs is not None:
+                # reduce
                 self.task.reduce_metrics(logging_outputs, self.get_criterion())
                 del logging_outputs
 
@@ -1556,7 +1624,9 @@ class Trainer(object):
 
             return xla_device_to_cpu(data)
 
+# end of trainer
 
+"""return shared params"""
 def _catalog_shared_params(module, memo=None, prefix=""):
     if memo is None:
         first_call = True
@@ -1580,7 +1650,7 @@ def _catalog_shared_params(module, memo=None, prefix=""):
 def _get_module_by_path(module, path):
     path = path.split(".")
     for name in path:
-        module = getattr(module, name)
+        module = getattr(module, name)  # Get a named attribute from an object： module.name
     return module
 
 

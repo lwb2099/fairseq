@@ -97,8 +97,9 @@ class FairseqDataclass:
 
 @dataclass
 class CommonConfig(FairseqDataclass):
-    # This is the core dataclass including common parameters shared by all different jobs. Please append your params to other dataclasses if they were
-    # used for a particular purpose or task, such as those dedicated for `distributed training`, `optimization`, etc.
+    # This is the core dataclass including common parameters shared by all different jobs.
+    # Please append your params to other dataclasses if they were used for a particular purpose or task,
+    # such as those dedicated for `distributed training`, `optimization`, etc.
     no_progress_bar: bool = field(
         default=False, metadata={"help": "disable progress bar"}
     )
@@ -1095,7 +1096,7 @@ class InteractiveConfig(FairseqDataclass):
         metadata={"help": "file to read from; use - for stdin"},
     )
 
-
+# 指数移动平均（Exponential Moving Average）/ 权重移动平均（Weighted Moving Average）
 @dataclass
 class EMAConfig(FairseqDataclass):
     store_ema: bool = field(

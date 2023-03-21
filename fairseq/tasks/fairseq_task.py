@@ -204,6 +204,7 @@ class FairseqTask(object):
         # ``FairseqDataset`` due to the base implementation there.
         return getattr(dataset, "can_reuse_epoch_itr_across_epochs", False)
 
+    # trainer.py中调用了(get_train/valid_iterator())
     def get_batch_iterator(
         self,
         dataset,
