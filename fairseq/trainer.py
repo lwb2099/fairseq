@@ -408,6 +408,7 @@ class Trainer(object):
             self._gathered_optim_state = st
 
     # 模型参数
+    """在trainer.save_ckp中调用"""
     def state_dict(self):
         state_dict = {
             "args": None,  # legacy

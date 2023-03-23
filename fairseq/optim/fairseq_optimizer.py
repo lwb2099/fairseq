@@ -90,6 +90,7 @@ class FairseqOptimizer(object):
             for group in self.param_groups:
                 group.update(optimizer_overrides)
 
+    """task.train_step()中criterion中返回的loss(Tensor), 然后train_step()屌用optimizer.backward()"""
     def backward(self, loss):
         """Computes the sum of gradients of the given tensor w.r.t. graph leaves."""
         loss.backward()

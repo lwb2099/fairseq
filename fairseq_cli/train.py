@@ -48,10 +48,12 @@ def main(cfg: FairseqConfig) -> None:
     utils.import_user_module(cfg.common)
     add_defaults(cfg)
 
+
     if (
         distributed_utils.is_master(cfg.distributed_training)
         and "job_logging_cfg" in cfg
     ):
+        """Omegaconf: 一个基于yaml的分层配置系统"""
         # make hydra logging work with ddp (see # see https://github.com/facebookresearch/hydra/issues/1126)
         logging.config.dictConfig(OmegaConf.to_container(cfg.job_logging_cfg))
 
@@ -67,6 +69,7 @@ def main(cfg: FairseqConfig) -> None:
     np.random.seed(cfg.common.seed)
     utils.set_torch_seed(cfg.common.seed)
 
+    # master节点检查ckp的路径
     if distributed_utils.is_master(cfg.distributed_training):
         checkpoint_utils.verify_checkpoint_directory(cfg.checkpoint.save_dir)
 
@@ -145,7 +148,7 @@ def main(cfg: FairseqConfig) -> None:
     # Build trainer
     if cfg.common.model_parallel_size == 1:
         trainer = Trainer(cfg, task, model, criterion, quantizer)
-    else:
+    else:  # model parallel with data parallel training.
         trainer = MegatronTrainer(cfg, task, model, criterion)
     logger.info(
         "training on {} devices (GPUs/TPUs)".format(
@@ -186,7 +189,7 @@ def main(cfg: FairseqConfig) -> None:
             )
             break
 
-        # train for one epoch
+        """======================train for one epoch========================="""
         valid_losses, should_stop = train(cfg, trainer, task, epoch_itr)
         if should_stop:
             break
@@ -201,6 +204,7 @@ def main(cfg: FairseqConfig) -> None:
             # don't cache epoch iterators for sharded datasets
             disable_iterator_cache=task.has_sharded_data("train"),
         )
+    # epoch == max_epoch
     train_meter.stop()
     logger.info("done training in {:.1f} seconds".format(train_meter.sum))
 
@@ -241,7 +245,7 @@ def should_stop_early(cfg: DictConfig, valid_loss: float) -> bool:
         else:
             return False
 
-
+"""train.py main()调用"""
 @metrics.aggregate("train")
 def train(
     cfg: DictConfig, trainer: Trainer, task: tasks.FairseqTask, epoch_itr
@@ -252,10 +256,11 @@ def train(
         fix_batches_to_gpus=cfg.distributed_training.fix_batches_to_gpus,
         shuffle=(epoch_itr.next_epoch_idx > cfg.dataset.curriculum),
     )
+    # update_freq: list[int]: update parameters every N_i batches, when in epoch i
     update_freq = (
         cfg.optimization.update_freq[epoch_itr.epoch - 1]
         if epoch_itr.epoch <= len(cfg.optimization.update_freq)
-        else cfg.optimization.update_freq[-1]
+        else cfg.optimization.update_freq[-1]  # 猜测：可能执行了epoch_i 但是update_freq还没有更新，所以取最后一个当做freq？？？
     )
     itr = iterators.GroupedIterator(
         itr,
@@ -264,6 +269,7 @@ def train(
     )
     if cfg.common.tpu:
         itr = utils.tpu_data_loader(itr)
+    # 打印日志
     progress = progress_bar.progress_bar(
         itr,
         log_format=cfg.common.log_format,
@@ -303,8 +309,11 @@ def train(
     )
     progress.update_config(_flatten_config(cfg))
 
+    # Called at the beginning of each epoch
     trainer.begin_epoch(epoch_itr.epoch)
 
+    # comma separated list of data subsets to use for validation"
+    #             " (e.g. train, valid, test)"
     valid_subsets = cfg.dataset.valid_subset.split(",")
     should_stop = False
     num_updates = trainer.get_num_updates()
@@ -327,6 +336,7 @@ def train(
                 metrics.reset_meters("train_inner")
 
         end_of_epoch = not itr.has_next()
+        """validate"""
         valid_losses, should_stop = validate_and_save(
             cfg, trainer, task, epoch_itr, valid_subsets, end_of_epoch
         )
@@ -391,14 +401,15 @@ def validate_and_save(
         )
 
     do_save = (
-        (end_of_epoch and epoch_itr.epoch % cfg.checkpoint.save_interval == 0)
-        or should_stop
+        # 本轮epoch跑完且到达了保存的间隔epoch
+        (end_of_epoch and epoch_itr.epoch % cfg.checkpoint.save_interval == 0)  # save a checkpoint every N epochs
+        or should_stop  # 停止训练
         or (
             cfg.checkpoint.save_interval_updates > 0
             and num_updates > 0
             and num_updates % cfg.checkpoint.save_interval_updates == 0
-            and num_updates >= cfg.dataset.validate_after_updates
-        )
+            and num_updates >= cfg.dataset.validate_after_updates  # dont validate until reaching this many updates
+        )  # 到了间隔update的保存点
     )
     do_validate = (
         (
@@ -418,8 +429,10 @@ def validate_and_save(
     # Validate
     valid_losses = [None]
     if do_validate:
+        # valuate the model on the validation set(s) and return the losses
         valid_losses = validate(cfg, trainer, task, epoch_itr, valid_subsets)
 
+    """只用第一个评判要不要stop early"""
     should_stop |= should_stop_early(cfg, valid_losses[0])
 
     # Save checkpoint
@@ -509,6 +522,7 @@ def validate(
         tracking_best = subset_idx == 0
         stats = get_valid_stats(cfg, trainer, agg.get_smoothed_values(), tracking_best)
 
+        # 没找到这个属性和函数在哪？？？
         if hasattr(task, "post_validate"):
             task.post_validate(trainer.get_model(), stats, agg)
 
@@ -522,11 +536,11 @@ def get_valid_stats(
     cfg: DictConfig,
     trainer: Trainer,
     stats: Dict[str, Any],
-    tracking_best: bool,
+    tracking_best: bool,  # only tracking the best metric on the 1st validation subset
 ) -> Dict[str, Any]:
     stats["num_updates"] = trainer.get_num_updates()
     if tracking_best and hasattr(checkpoint_utils.save_checkpoint, "best"):
-        key = "best_{0}".format(cfg.checkpoint.best_checkpoint_metric)
+        key = "best_{0}".format(cfg.checkpoint.best_checkpoint_metric)  # "best_{best_checkpoint_metric}"
         best_function = max if cfg.checkpoint.maximize_best_checkpoint_metric else min
         stats[key] = best_function(
             checkpoint_utils.save_checkpoint.best,

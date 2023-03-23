@@ -40,6 +40,7 @@ def progress_bar(
     wandb_run_name: Optional[str] = None,
     azureml_logging: Optional[bool] = False,
 ):
+    # log format
     if log_format is None:
         log_format = default_log_format
     if log_file is not None:
@@ -60,8 +61,8 @@ def progress_bar(
     else:
         raise ValueError("Unknown log format: {}".format(log_format))
 
-    if aim_repo:
-        bar = AimProgressBarWrapper(
+    if aim_repo:  # aim是一个库
+        bar = AimProgressBarWrapper(  # log to aim
             bar,
             aim_repo=aim_repo,
             aim_run_hash=aim_run_hash,

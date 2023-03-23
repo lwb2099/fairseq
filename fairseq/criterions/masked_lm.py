@@ -81,6 +81,7 @@ class MaskedLmLoss(FairseqCriterion):
         loss_sum = sum(log.get("loss", 0) for log in logging_outputs)
         sample_size = sum(log.get("sample_size", 0) for log in logging_outputs)
 
+        # 为什么除以根号2：loss的值域比较大的时候，控制loss在一个合理的范围内(一个经验性的选择)
         metrics.log_scalar(
             "loss", loss_sum / sample_size / math.log(2), sample_size, round=3
         )

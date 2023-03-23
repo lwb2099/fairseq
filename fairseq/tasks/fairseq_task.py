@@ -61,7 +61,7 @@ class FairseqTask(object):
     This is necessary so that when loading checkpoints, we can properly
     recreate the task state after initializing the task instance.
     """
-
+    # 需要从ckp读取/存入的需要存在self.state
     @classmethod
     def add_args(cls, parser):
         """Add task-specific arguments to the parser."""
@@ -126,6 +126,7 @@ class FairseqTask(object):
         """
         return cls(cfg, **kwargs)
 
+    # 子类才会用到split（train，valid，test）,判断split是否有被share(？
     def has_sharded_data(self, split):
         return os.pathsep in getattr(self.cfg, "data", "")
 
@@ -320,6 +321,7 @@ class FairseqTask(object):
             persistent_workers=persistent_workers,
         )
 
+        # 存入dataset_to_epoch_iter, 下次如果可以reuse而且有dataset，直接取出返回
         if can_reuse_epoch_itr:
             self.dataset_to_epoch_iter[dataset] = epoch_iter
 
@@ -488,6 +490,7 @@ class FairseqTask(object):
             **extra_gen_cls_kwargs,
         )
 
+    """_cli.train中调用trainer.train_step(), trainer中调用task.train_step"""
     def train_step(
         self, sample, model, criterion, optimizer, update_num, ignore_grad=False
     ):
@@ -514,11 +517,14 @@ class FairseqTask(object):
         model.train()
         model.set_num_updates(update_num)
         with torch.autograd.profiler.record_function("forward"):
+            # 半精度混合训练
             with torch.cuda.amp.autocast(enabled=(isinstance(optimizer, AMPOptimizer))):
+                # forward
                 loss, sample_size, logging_output = criterion(model, sample)
         if ignore_grad:
             loss *= 0
         with torch.autograd.profiler.record_function("backward"):
+            # backward
             optimizer.backward(loss)
         return loss, sample_size, logging_output
 
@@ -528,6 +534,7 @@ class FairseqTask(object):
             loss, sample_size, logging_output = criterion(model, sample)
         return loss, sample_size, logging_output
 
+    """update step"""
     def optimizer_step(self, optimizer, model, update_num):
         optimizer.step()
 
@@ -544,6 +551,7 @@ class FairseqTask(object):
                 models, sample, prefix_tokens=prefix_tokens, constraints=constraints
             )
 
+    """在trainer.begin_epoch中调用"""
     def begin_epoch(self, epoch, model):
         """Hook function called before the start of each epoch."""
         pass
@@ -562,11 +570,17 @@ class FairseqTask(object):
             self.reduce_metrics(logging_outputs, criterion)
             return agg.get_smoothed_values()
 
+    """有的Task重写并继承这个方法
+    e.g.
+    def reduce_metrics(...):
+        super().reduce_metrics(logging_outputs, criterion)
+    """
     def reduce_metrics(self, logging_outputs, criterion):
         """Aggregate logging outputs from data parallel training."""
         # backward compatibility for tasks that override aggregate_logging_outputs
         base_func = FairseqTask.aggregate_logging_outputs
         self_func = getattr(self, "aggregate_logging_outputs").__func__
+        # ？？？不会循环调用吗
         if self_func is not base_func:
             utils.deprecation_warning(
                 "Tasks should implement the reduce_metrics API. "
@@ -611,6 +625,7 @@ class FairseqTask(object):
         """Return the max input length allowed by the task."""
         return None
 
+    """在一个例子中的model.build_model中调用"""
     @property
     def source_dictionary(self):
         """Return the source :class:`~fairseq.data.Dictionary` (if applicable
@@ -623,6 +638,7 @@ class FairseqTask(object):
         for this task)."""
         raise NotImplementedError
 
+    """e.g.: 在generate.py _main()中调用"""
     def build_tokenizer(self, args):
         """Build the pre-tokenizer for this task."""
         return encoders.build_tokenizer(args)
@@ -631,6 +647,7 @@ class FairseqTask(object):
         """Build the tokenizer for this task."""
         return encoders.build_bpe(args)
 
+    """fairseq_cli.interactive.make_batch中调用"""
     def get_interactive_tokens_and_lengths(self, lines, encode_fn):
         tokens = [
             self.source_dictionary.encode_line(
@@ -641,7 +658,14 @@ class FairseqTask(object):
         lengths = [t.numel() for t in tokens]
         return tokens, lengths
 
-
+"""
+其他的Task继承的是这个类，而不是FairseqTask
+和基类的方法的实现都一样，但是参数都是args(基类都是cfg)
+e.g.
+@register_task("abc")
+class ABCTask(LegacyFairseqTask):
+    ...
+"""
 class LegacyFairseqTask(FairseqTask):
     def __init__(self, args: Namespace):
         super().__init__(None)

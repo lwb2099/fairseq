@@ -12,7 +12,7 @@ from fairseq.dataclass.utils import gen_parser_from_dataclass
 from torch.nn.modules.loss import _Loss
 
 
-class FairseqCriterion(_Loss):
+class FairseqCriterion(_Loss):  # 继承nn.Modules.Loss中的基类
     def __init__(self, task):
         super().__init__()
         self.task = task
@@ -80,6 +80,7 @@ class FairseqCriterion(_Loss):
         )
         raise NotImplementedError
 
+    # 子类都会重写
     @classmethod
     def reduce_metrics(cls, logging_outputs: List[Dict[str, Any]]) -> None:
         """Aggregate logging outputs from data parallel training."""
