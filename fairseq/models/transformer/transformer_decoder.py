@@ -267,6 +267,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         Translate with Transformer Models" (Garg et al., EMNLP 2019).
 
         Args:
+            encoder_out:
             full_context_alignment (bool, optional): don't apply
                 auto-regressive mask to self-attention (default: False).
             alignment_layer (int, optional): return mean alignment over

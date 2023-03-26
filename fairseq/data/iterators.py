@@ -382,6 +382,12 @@ class EpochBatchIterator(EpochBatchIterating):
 
     @property
     def next_epoch_idx(self):
+        """
+        在重新生成一个epoch的数据时，返回对应的epoch的idx
+        如果当前的epoch已经使用完，需要对下一个epoch生成数据(end_of_epoch=True)
+        返回self.epoch+1
+        否则返回self.epoch
+        """
         """Return the epoch index after *next_epoch_itr* is called."""
         if self._next_epoch_itr is not None:
             return self.epoch
@@ -393,7 +399,9 @@ class EpochBatchIterator(EpochBatchIterating):
     def next_epoch_itr(
         self, shuffle=True, fix_batches_to_gpus=False, set_dataset_epoch=True
     ):
-        """Return a new iterator over the dataset.
+        """
+        在新的epoch中，对数据进行重新的生成 \n
+        Return a new iterator over the dataset.
 
         Args:
             shuffle (bool, optional): shuffle batches before returning the
@@ -572,7 +580,7 @@ class EpochBatchIterator(EpochBatchIterating):
 
 class GroupedIterator(CountingIterator):
     """Wrapper around an iterable that returns groups (chunks) of items.
-
+        类似于make batch，对一个epoch的数据进行了分组
     Args:
         iterable (iterable): iterable to wrap
         chunk_size (int): size of each chunk

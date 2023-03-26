@@ -60,16 +60,19 @@ def main(cfg: FairseqConfig) -> None:
     assert (
         cfg.dataset.max_tokens is not None or cfg.dataset.batch_size is not None
     ), "Must specify batch size either with --max-tokens or --batch-size"
+
+    """1. reset metrics"""
     metrics.reset()
 
     if cfg.common.log_file is not None:
         handler = logging.FileHandler(filename=cfg.common.log_file)
         logger.addHandler(handler)
 
+    """2. 设置随机种子"""
     np.random.seed(cfg.common.seed)
     utils.set_torch_seed(cfg.common.seed)
 
-    # master节点检查ckp的路径
+    """3. master节点检查ckp的路径"""
     if distributed_utils.is_master(cfg.distributed_training):
         checkpoint_utils.verify_checkpoint_directory(cfg.checkpoint.save_dir)
 
@@ -86,12 +89,12 @@ def main(cfg: FairseqConfig) -> None:
             )
             return
 
-    # Setup task, e.g., translation, language modeling, etc.
+    """4. Setup task, e.g., translation, language modeling, etc."""
     task = tasks.setup_task(cfg.task)
 
     assert cfg.criterion, "Please specify criterion to train a model"
 
-    # Build model and criterion
+    """5. Build model and criterion"""
     if cfg.distributed_training.ddp_backend == "fully_sharded":
         with fsdp_enable_wrap(cfg.distributed_training):
             model = fsdp_wrap(task.build_model(cfg.model))
@@ -126,8 +129,8 @@ def main(cfg: FairseqConfig) -> None:
         )
     )
 
-    # Load valid dataset (we load training data below, based on the latest checkpoint)
-    # We load the valid dataset AFTER building the model
+    """6. Load valid dataset (we load training data below, based on the latest checkpoint)
+          We load the valid dataset AFTER building the model"""
     data_utils.raise_if_valid_subsets_unintentionally_ignored(cfg)
     if cfg.dataset.combine_valid_subsets:
         task.load_dataset("valid", combine=True, epoch=1)
@@ -145,7 +148,7 @@ def main(cfg: FairseqConfig) -> None:
     else:
         quantizer = None
 
-    # Build trainer
+    """7. Build trainer"""
     if cfg.common.model_parallel_size == 1:
         trainer = Trainer(cfg, task, model, criterion, quantizer)
     else:  # model parallel with data parallel training.
@@ -162,25 +165,31 @@ def main(cfg: FairseqConfig) -> None:
         )
     )
 
-    # Load the latest checkpoint if one is available and restore the
-    # corresponding train iterator
+    """8. Load the latest checkpoint if one is available and restore the
+          corresponding train iterator(实际上就已经load了train data)"""
     extra_state, epoch_itr = checkpoint_utils.load_checkpoint(
         cfg.checkpoint,
         trainer,
         # don't cache epoch iterators for sharded datasets
         disable_iterator_cache=task.has_sharded_data("train"),
     )
+
+    print(', '.join(f"{key}: {type(value)}" for key, value in vars(epoch_itr).items()))
+
     if cfg.common.tpu:
         import torch_xla.core.xla_model as xm
 
         xm.rendezvous("load_checkpoint")  # wait for all workers
 
+    """9. load max_epoch and lr"""
     max_epoch = cfg.optimization.max_epoch or math.inf
     lr = trainer.get_lr()
 
     train_meter = meters.StopwatchMeter()
     train_meter.start()
+    """10. start training"""
     while epoch_itr.next_epoch_idx <= max_epoch:
+        """11. examine stop-min-lr"""
         if lr <= cfg.optimization.stop_min_lr:
             logger.info(
                 f"stopping training because current learning rate ({lr}) is smaller "
@@ -189,22 +198,24 @@ def main(cfg: FairseqConfig) -> None:
             )
             break
 
-        """======================train for one epoch========================="""
+        """======================12. train for one epoch========================="""
         valid_losses, should_stop = train(cfg, trainer, task, epoch_itr)
         if should_stop:
             break
 
+        """13. update lr by validation loss[0]"""
         # only use first validation loss to update the learning rate
         lr = trainer.lr_step(epoch_itr.epoch, valid_losses[0])
 
+        """14. 获取下一个batch"""
         epoch_itr = trainer.get_train_iterator(
-            epoch_itr.next_epoch_idx,
+            epoch_itr.next_epoch_idx,  # =epoch if not end_of_epoch, else epoch+1
             # sharded data: get train iterator for next epoch
             load_dataset=task.has_sharded_data("train"),
             # don't cache epoch iterators for sharded datasets
             disable_iterator_cache=task.has_sharded_data("train"),
         )
-    # epoch == max_epoch
+    # epoch == max_epoch or should stop
     train_meter.stop()
     logger.info("done training in {:.1f} seconds".format(train_meter.sum))
 
@@ -245,23 +256,31 @@ def should_stop_early(cfg: DictConfig, valid_loss: float) -> bool:
         else:
             return False
 
-"""train.py main()调用"""
+"""train.py main()调用
+    returns: validation_losses
+             should_stop
+"""
 @metrics.aggregate("train")
 def train(
     cfg: DictConfig, trainer: Trainer, task: tasks.FairseqTask, epoch_itr
 ) -> Tuple[List[Optional[float]], bool]:
     """Train the model for one epoch and return validation losses."""
-    # Initialize data iterator
+    """1. Initialize data iterator"""
+    # Return a new iterator over the dataset
     itr = epoch_itr.next_epoch_itr(
         fix_batches_to_gpus=cfg.distributed_training.fix_batches_to_gpus,
-        shuffle=(epoch_itr.next_epoch_idx > cfg.dataset.curriculum),
+        shuffle=(epoch_itr.next_epoch_idx > cfg.dataset.curriculum),  # curriculum: don't shuffle batches for first N epochs
     )
-    # update_freq: list[int]: update parameters every N_i batches, when in epoch i
+    """2. update_freq: list[int]: update parameters every 
+          N_i batches, when in epoch i"""
     update_freq = (
         cfg.optimization.update_freq[epoch_itr.epoch - 1]
         if epoch_itr.epoch <= len(cfg.optimization.update_freq)
-        else cfg.optimization.update_freq[-1]  # 猜测：可能执行了epoch_i 但是update_freq还没有更新，所以取最后一个当做freq？？？
+        # 猜测：可能执行了epoch_i 但是update_freq还没有更新，所以取最后一个当做freq？？？
+        else cfg.optimization.update_freq[-1]
     )
+    """3. (不明白啥原理)Wrapper around an iterable 
+          that returns groups (chunks) of items."""
     itr = iterators.GroupedIterator(
         itr,
         update_freq,
@@ -269,7 +288,7 @@ def train(
     )
     if cfg.common.tpu:
         itr = utils.tpu_data_loader(itr)
-    # 打印日志
+    """4. 打印日志的progress(不明白)"""
     progress = progress_bar.progress_bar(
         itr,
         log_format=cfg.common.log_format,
@@ -307,17 +326,22 @@ def train(
             else False
         ),
     )
+    """5. update config"""
     progress.update_config(_flatten_config(cfg))
 
+    """6. trainer. begin epoch"""
     # Called at the beginning of each epoch
     trainer.begin_epoch(epoch_itr.epoch)
 
     # comma separated list of data subsets to use for validation"
     #             " (e.g. train, valid, test)"
+    """7. get valid_subset, num_updates"""
     valid_subsets = cfg.dataset.valid_subset.split(",")
     should_stop = False
     num_updates = trainer.get_num_updates()
     logger.info("Start iterating over samples")
+
+    """8. train for one batch"""
     for i, samples in enumerate(progress):
         with metrics.aggregate("train_inner"), torch.autograd.profiler.record_function(
             "train_step-%d" % i
@@ -325,18 +349,18 @@ def train(
             log_output = trainer.train_step(samples)
 
         if log_output is not None:  # not OOM, overflow, ...
-            # log mid-epoch stats
+            """9. log mid-epoch stats"""
             num_updates = trainer.get_num_updates()
             if num_updates % cfg.common.log_interval == 0:
                 stats = get_training_stats(metrics.get_smoothed_values("train_inner"))
                 progress.log(stats, tag="train_inner", step=num_updates)
 
-                # reset mid-epoch stats after each log interval
-                # the end-of-epoch stats will still be preserved
+                """10. reset mid-epoch stats after each log interval
+                       the end-of-epoch stats will still be preserved"""
                 metrics.reset_meters("train_inner")
 
         end_of_epoch = not itr.has_next()
-        """validate"""
+        """11. validate"""
         valid_losses, should_stop = validate_and_save(
             cfg, trainer, task, epoch_itr, valid_subsets, end_of_epoch
         )
@@ -344,12 +368,12 @@ def train(
         if should_stop:
             break
 
-    # log end-of-epoch stats
+    """12. log end-of-epoch stats"""
     logger.info("end of epoch {} (average epoch stats below)".format(epoch_itr.epoch))
     stats = get_training_stats(metrics.get_smoothed_values("train"))
     progress.print(stats, tag="train", step=num_updates)
 
-    # reset epoch-level meters
+    """13. reset epoch-level meters"""
     metrics.reset_meters("train")
     return valid_losses, should_stop
 
@@ -381,6 +405,7 @@ def validate_and_save(
     # Stopping conditions (and an additional one based on validation loss later
     # on)
     should_stop = False
+    """1. check stop: num_updates > max_updates"""
     if num_updates >= max_update:
         should_stop = True
         logger.info(
@@ -388,10 +413,10 @@ def validate_and_save(
             f"num_updates: {num_updates} >= max_update: {max_update}"
         )
 
+    """2. check stop: training hour > stop  hour"""
     training_time_hours = trainer.cumulative_training_time() / (60 * 60)
     if (
-        cfg.optimization.stop_time_hours > 0
-        and training_time_hours > cfg.optimization.stop_time_hours
+            0 < cfg.optimization.stop_time_hours < training_time_hours
     ):
         should_stop = True
         logger.info(
@@ -399,7 +424,7 @@ def validate_and_save(
             f"cumulative_training_time: {training_time_hours} > "
             f"stop_time_hours: {cfg.optimization.stop_time_hours} hour(s)"
         )
-
+    """3. check do_save"""
     do_save = (
         # 本轮epoch跑完且到达了保存的间隔epoch
         (end_of_epoch and epoch_itr.epoch % cfg.checkpoint.save_interval == 0)  # save a checkpoint every N epochs
@@ -408,9 +433,10 @@ def validate_and_save(
             cfg.checkpoint.save_interval_updates > 0
             and num_updates > 0
             and num_updates % cfg.checkpoint.save_interval_updates == 0
-            and num_updates >= cfg.dataset.validate_after_updates  # dont validate until reaching this many updates
+            and num_updates >= cfg.dataset.validate_after_updates  # don't validate until reaching this many updates
         )  # 到了间隔update的保存点
     )
+    """4. check do_validate"""
     do_validate = (
         (
             (not end_of_epoch and do_save)  # validate during mid-epoch saves
@@ -426,16 +452,15 @@ def validate_and_save(
         and num_updates >= cfg.dataset.validate_after_updates
     )
 
-    # Validate
+    """5. validate"""
     valid_losses = [None]
     if do_validate:
         # valuate the model on the validation set(s) and return the losses
         valid_losses = validate(cfg, trainer, task, epoch_itr, valid_subsets)
 
-    """只用第一个评判要不要stop early"""
+    # 只用第一个评判要不要stop early
     should_stop |= should_stop_early(cfg, valid_losses[0])
-
-    # Save checkpoint
+    """6. Save checkpoint"""
     if do_save or should_stop:
         checkpoint_utils.save_checkpoint(
             cfg.checkpoint, trainer, epoch_itr, valid_losses[0]
@@ -457,13 +482,14 @@ def validate(
     subsets: List[str],
 ) -> List[Optional[float]]:
     """Evaluate the model on the validation set(s) and return the losses."""
-
     if cfg.dataset.fixed_validation_seed is not None:
         # set fixed seed for every validation
         utils.set_torch_seed(cfg.dataset.fixed_validation_seed)
 
+    """1. trainer begin_valid_epoch"""
     trainer.begin_valid_epoch(epoch_itr.epoch)
     valid_losses = []
+    """2. validate on each subset"""
     for subset_idx, subset in enumerate(subsets):
         logger.info('begin validation on "{}" subset'.format(subset))
 
@@ -473,6 +499,7 @@ def validate(
         )
         if cfg.common.tpu:
             itr = utils.tpu_data_loader(itr)
+        """3. get progress_bar"""
         progress = progress_bar.progress_bar(
             itr,
             log_format=cfg.common.log_format,
@@ -508,6 +535,7 @@ def validate(
 
         # create a new root metrics aggregator so validation metrics
         # don't pollute other aggregators (e.g., train meters)
+        """4. do one validate step"""
         with metrics.aggregate(new_root=True) as agg:
             for i, sample in enumerate(progress):
                 if (
@@ -517,7 +545,7 @@ def validate(
                     break
                 trainer.valid_step(sample)
 
-        # log validation stats
+        """5. log validation stats"""
         # only tracking the best metric on the 1st validation subset
         tracking_best = subset_idx == 0
         stats = get_valid_stats(cfg, trainer, agg.get_smoothed_values(), tracking_best)

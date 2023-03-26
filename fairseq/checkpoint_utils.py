@@ -18,7 +18,7 @@ from typing import Any, Dict, Optional, Union
 
 import numpy as np
 import torch
-from fairseq.data import data_utils
+from fairseq.data import data_utils, EpochBatchIterator
 from fairseq.dataclass.configs import CheckpointConfig
 from fairseq.dataclass.utils import (
     convert_namespace_to_omegaconf,
@@ -191,6 +191,9 @@ def load_checkpoint(cfg: CheckpointConfig, trainer, **passthrough_args):
 
     *passthrough_args* will be passed through to
     ``trainer.get_train_iterator``.
+    Returns:
+        extra_state
+        epoch_itr
     """
 
     reset_optimizer = cfg.reset_optimizer
@@ -264,7 +267,7 @@ def load_checkpoint(cfg: CheckpointConfig, trainer, **passthrough_args):
     if extra_state is not None and not reset_dataloader:
         # restore iterator from checkpoint
         itr_state = extra_state["train_iterator"]
-        epoch_itr = trainer.get_train_iterator(
+        epoch_itr: EpochBatchIterator = trainer.get_train_iterator(
             epoch=itr_state["epoch"], load_dataset=True, **passthrough_args
         )
         epoch_itr.load_state_dict(itr_state)

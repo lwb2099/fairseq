@@ -49,10 +49,12 @@ class ModelCriterion(FairseqCriterion):
         self.log_keys = log_keys
 
     def forward(self, model, sample, reduce=True):
+        """1. get output"""
         net_output = model(**sample["net_input"])
 
         scaled_losses = {}
 
+        """2. get loss"""
         if hasattr(model, "get_losses"):
             losses = model.get_losses(net_output, sample)
         elif isinstance(net_output, dict) and "losses" in net_output:
@@ -60,6 +62,7 @@ class ModelCriterion(FairseqCriterion):
         else:
             raise Exception("Could not retrieve losses")
 
+        """3. get coef"""
         for lk, p in losses.items():
             try:
                 coef = 1.0 if len(self.loss_weights) == 0 else self.loss_weights[lk]
@@ -71,13 +74,15 @@ class ModelCriterion(FairseqCriterion):
             if coef != 0 and p is not None:
                 scaled_losses[lk] = coef * p.float()
 
+        """4. get total loss"""
         loss = sum(scaled_losses.values())
-
+        """5. get sample size"""
         if "sample_size" in net_output:
             sample_size = net_output["sample_size"]
         else:
             sample_size = loss.numel()
 
+        """6. if reduce"""
         if reduce and loss.numel() > 1:
             loss = loss.sum()
 
@@ -88,7 +93,7 @@ class ModelCriterion(FairseqCriterion):
             "sample_size": sample_size,
             "_world_size": 1,
         }
-
+        """7. logging output"""
         for lk in self.log_keys:
             if lk in net_output and net_output[lk] is not None:
                 if not torch.is_tensor(net_output[lk]) or net_output[lk].numel() == 1:

@@ -11,12 +11,11 @@ from typing import Any, Callable, Dict, List
 
 import torch
 from fairseq import metrics, search, tokenizer, utils
-from fairseq.data import Dictionary, FairseqDataset, data_utils, encoders, iterators
+from fairseq.data import Dictionary, FairseqDataset, data_utils, encoders, iterators, EpochBatchIterator
 from fairseq.dataclass import FairseqDataclass
 from fairseq.dataclass.utils import gen_parser_from_dataclass
 from fairseq.optim.amp_optimizer import AMPOptimizer
 from omegaconf import DictConfig
-
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +60,7 @@ class FairseqTask(object):
     This is necessary so that when loading checkpoints, we can properly
     recreate the task state after initializing the task instance.
     """
+
     # 需要从ckp读取/存入的需要存在self.state
     @classmethod
     def add_args(cls, parser):
@@ -95,7 +95,7 @@ class FairseqTask(object):
 
     @classmethod
     def build_dictionary(
-        cls, filenames, workers=1, threshold=-1, nwords=-1, padding_factor=8
+            cls, filenames, workers=1, threshold=-1, nwords=-1, padding_factor=8
     ):
         """Build the dictionary
 
@@ -131,11 +131,11 @@ class FairseqTask(object):
         return os.pathsep in getattr(self.cfg, "data", "")
 
     def load_dataset(
-        self,
-        split: str,
-        combine: bool = False,
-        task_cfg: FairseqDataclass = None,
-        **kwargs,
+            self,
+            split: str,
+            combine: bool = False,
+            task_cfg: FairseqDataclass = None,
+            **kwargs,
     ):
         """Load a given dataset split.
 
@@ -166,7 +166,7 @@ class FairseqTask(object):
         return self.datasets[split]
 
     def filter_indices_by_size(
-        self, indices, dataset, max_positions=None, ignore_invalid_inputs=False
+            self, indices, dataset, max_positions=None, ignore_invalid_inputs=False
     ):
         """
         Filter examples that are too large
@@ -207,24 +207,24 @@ class FairseqTask(object):
 
     # trainer.py中调用了(get_train/valid_iterator())
     def get_batch_iterator(
-        self,
-        dataset,
-        max_tokens=None,
-        max_sentences=None,
-        max_positions=None,
-        ignore_invalid_inputs=False,
-        required_batch_size_multiple=1,
-        seed=1,
-        num_shards=1,
-        shard_id=0,
-        num_workers=0,
-        epoch=1,
-        data_buffer_size=0,
-        disable_iterator_cache=False,
-        skip_remainder_batch=False,
-        grouped_shuffling=False,
-        update_epoch_batch_itr=False,
-    ):
+            self,
+            dataset,
+            max_tokens=None,
+            max_sentences=None,
+            max_positions=None,
+            ignore_invalid_inputs=False,
+            required_batch_size_multiple=1,
+            seed=1,
+            num_shards=1,
+            shard_id=0,
+            num_workers=0,
+            epoch=1,
+            data_buffer_size=0,
+            disable_iterator_cache=False,
+            skip_remainder_batch=False,
+            grouped_shuffling=False,
+            update_epoch_batch_itr=False,
+    ) -> EpochBatchIterator:
         """
         Get an iterator that yields batches of data from the given dataset.
 
@@ -270,9 +270,9 @@ class FairseqTask(object):
                 given dataset split
         """
         can_reuse_epoch_itr = (
-            not disable_iterator_cache
-            and not update_epoch_batch_itr
-            and self.can_reuse_epoch_itr(dataset)
+                not disable_iterator_cache
+                and not update_epoch_batch_itr
+                and self.can_reuse_epoch_itr(dataset)
         )
         if can_reuse_epoch_itr and dataset in self.dataset_to_epoch_iter:
             logger.debug("reusing EpochBatchIterator for epoch {}".format(epoch))
@@ -305,6 +305,7 @@ class FairseqTask(object):
         persistent_workers = getattr(self.cfg, "persistent_workers", False)
 
         # return a reusable, sharded iterator
+        # 类似于Dataloader
         epoch_iter = iterators.EpochBatchIterator(
             dataset=dataset,
             collate_fn=dataset.collater,
@@ -360,12 +361,12 @@ class FairseqTask(object):
         return criterions.build_criterion(cfg, self)
 
     def build_generator(
-        self,
-        models,
-        args,
-        seq_gen_cls=None,
-        extra_gen_cls_kwargs=None,
-        prefix_allowed_tokens_fn=None,
+            self,
+            models,
+            args,
+            seq_gen_cls=None,
+            extra_gen_cls_kwargs=None,
+            prefix_allowed_tokens_fn=None,
     ):
         """
         Build a :class:`~fairseq.SequenceGenerator` instance for this
@@ -416,16 +417,16 @@ class FairseqTask(object):
         if prefix_allowed_tokens_fn is None:
             prefix_allowed_tokens_fn = getattr(args, "prefix_allowed_tokens_fn", None)
         if (
-            sum(
-                int(cond)
-                for cond in [
-                    sampling,
-                    diverse_beam_groups > 0,
-                    match_source_len,
-                    diversity_rate > 0,
-                ]
-            )
-            > 1
+                sum(
+                    int(cond)
+                    for cond in [
+                        sampling,
+                        diverse_beam_groups > 0,
+                        match_source_len,
+                        diversity_rate > 0,
+                    ]
+                )
+                > 1
         ):
             raise ValueError("Provided Search parameters are mutually exclusive.")
         assert sampling_topk < 0 or sampling, "--sampling-topk requires --sampling"
@@ -491,8 +492,9 @@ class FairseqTask(object):
         )
 
     """_cli.train中调用trainer.train_step(), trainer中调用task.train_step"""
+
     def train_step(
-        self, sample, model, criterion, optimizer, update_num, ignore_grad=False
+            self, sample, model, criterion, optimizer, update_num, ignore_grad=False
     ):
         """
         Do forward and backward, and return the loss as computed by *criterion*
@@ -506,7 +508,6 @@ class FairseqTask(object):
             optimizer (~fairseq.optim.FairseqOptimizer): the optimizer
             update_num (int): the current update
             ignore_grad (bool): multiply loss by 0 if this is set to True
-
         Returns:
             tuple:
                 - the loss
@@ -514,17 +515,18 @@ class FairseqTask(object):
                   gradient
                 - logging outputs to display while training
         """
+        """1. train&set_num_update"""
         model.train()
         model.set_num_updates(update_num)
         with torch.autograd.profiler.record_function("forward"):
             # 半精度混合训练
             with torch.cuda.amp.autocast(enabled=(isinstance(optimizer, AMPOptimizer))):
-                # forward
+                """2. forward"""
                 loss, sample_size, logging_output = criterion(model, sample)
         if ignore_grad:
             loss *= 0
         with torch.autograd.profiler.record_function("backward"):
-            # backward
+            """3. backward"""
             optimizer.backward(loss)
         return loss, sample_size, logging_output
 
@@ -539,12 +541,12 @@ class FairseqTask(object):
         optimizer.step()
 
     def build_dataset_for_inference(
-        self, src_tokens: List[torch.Tensor], src_lengths: List[int], **kwargs
+            self, src_tokens: List[torch.Tensor], src_lengths: List[int], **kwargs
     ) -> torch.utils.data.Dataset:
         raise NotImplementedError
 
     def inference_step(
-        self, generator, models, sample, prefix_tokens=None, constraints=None
+            self, generator, models, sample, prefix_tokens=None, constraints=None
     ):
         with torch.no_grad():
             return generator.generate(
@@ -553,7 +555,8 @@ class FairseqTask(object):
 
     """在trainer.begin_epoch中调用"""
     def begin_epoch(self, epoch, model):
-        """Hook function called before the start of each epoch."""
+        """Hook function called before
+           the start of each epoch."""
         pass
 
     def begin_valid_epoch(self, epoch, model):
@@ -626,6 +629,7 @@ class FairseqTask(object):
         return None
 
     """在一个例子中的model.build_model中调用"""
+
     @property
     def source_dictionary(self):
         """Return the source :class:`~fairseq.data.Dictionary` (if applicable
@@ -639,6 +643,7 @@ class FairseqTask(object):
         raise NotImplementedError
 
     """e.g.: 在generate.py _main()中调用"""
+
     def build_tokenizer(self, args):
         """Build the pre-tokenizer for this task."""
         return encoders.build_tokenizer(args)
@@ -648,6 +653,7 @@ class FairseqTask(object):
         return encoders.build_bpe(args)
 
     """fairseq_cli.interactive.make_batch中调用"""
+
     def get_interactive_tokens_and_lengths(self, lines, encode_fn):
         tokens = [
             self.source_dictionary.encode_line(
@@ -658,6 +664,7 @@ class FairseqTask(object):
         lengths = [t.numel() for t in tokens]
         return tokens, lengths
 
+
 """
 其他的Task继承的是这个类，而不是FairseqTask
 和基类的方法的实现都一样，但是参数都是args(基类都是cfg)
@@ -666,6 +673,8 @@ e.g.
 class ABCTask(LegacyFairseqTask):
     ...
 """
+
+
 class LegacyFairseqTask(FairseqTask):
     def __init__(self, args: Namespace):
         super().__init__(None)

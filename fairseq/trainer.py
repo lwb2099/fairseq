@@ -20,6 +20,7 @@ import torch
 from omegaconf import OmegaConf
 
 from fairseq import checkpoint_utils, models, optim, utils
+from fairseq.data import EpochBatchIterator
 from fairseq.dataclass.configs import FairseqConfig
 from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 from fairseq.distributed import utils as distributed_utils
@@ -723,8 +724,9 @@ class Trainer(object):
             data_selector=None,
             shard_batch_itr=True,
             disable_iterator_cache=False,
-    ):
-        """Return an EpochBatchIterator over the training set for a given epoch."""
+    ) -> EpochBatchIterator:
+        """Return an EpochBatchIterator over the training set for a given epoch.\n
+           重新生成一个epoch需要使用的训练集的数据"""
         if load_dataset:
             logger.info("loading train data for epoch {}".format(epoch))
             self.task.load_dataset(
@@ -736,7 +738,7 @@ class Trainer(object):
             )
         # Get an iterator that yields batches of data from the given dataset
         # for details，see：tasks/fairseq_task.py
-        batch_iterator = self.task.get_batch_iterator(
+        batch_iterator: EpochBatchIterator = self.task.get_batch_iterator(
             dataset=self.task.dataset(self.cfg.dataset.train_subset),
             max_tokens=self.cfg.dataset.max_tokens,
             max_sentences=self.cfg.dataset.batch_size,
@@ -796,16 +798,19 @@ class Trainer(object):
         return batch_iterator
 
     def begin_epoch(self, epoch):
-        """Called at the beginning of each epoch."""
+        """Called at the beginning of each epoch.
+        1. adjust lr at beginning of epoch
+        2. task.begin_epoch
+        """
         logger.info("begin training epoch {}".format(epoch))
 
-        # Adjust the learning rate at the beginning of the epoch
+        """1. Adjust the learning rate at the beginning of the epoch"""
         self.lr_step_begin_epoch(epoch)
 
         if self.quantizer is not None:
             self.quantizer.begin_epoch(epoch)
 
-        # task specific setup per epoch
+        """2. task specific setup per epoch"""
         self.task.begin_epoch(epoch, self.get_model())
 
         if self.tpu:
@@ -842,6 +847,7 @@ class Trainer(object):
 
         """====================forward and backward pass===================="""
         logging_outputs, sample_size, ooms = [], 0, 0
+        """1. prepare sample"""
         for i, sample in enumerate(samples):  # delayed update loop
             sample, is_dummy_batch = self._prepare_sample(sample)
 
@@ -869,7 +875,7 @@ class Trainer(object):
 
             try:
                 with maybe_no_sync():
-                    # forward and backward
+                    """2. forward and backward"""
                     loss, sample_size_i, logging_output = self.task.train_step(
                         sample=sample,
                         model=self.model,
@@ -880,7 +886,6 @@ class Trainer(object):
                         **extra_kwargs,
                     )
                     del loss
-
                 logging_outputs.append(logging_output)
                 sample_size += sample_size_i
 
@@ -952,8 +957,9 @@ class Trainer(object):
             )
 
         overflow = False
-        """=======================an optimize step==========================="""
+        """=======================3. an optimize step==========================="""
         try:
+            """分布式 - 处理grads"""
             with torch.autograd.profiler.record_function("reduce-grads"):
                 # reduce gradients across workers
                 self.optimizer.all_reduce_grads(self.model)
@@ -1001,7 +1007,7 @@ class Trainer(object):
                         raise FloatingPointError("gradients are Nan/Inf")
 
             with torch.autograd.profiler.record_function("optimizer"):
-                """take an optimization step"""
+                """5. take an optimization step"""
                 self.task.optimizer_step(
                     self.optimizer, model=self.model, update_num=self.get_num_updates()
                 )
@@ -1058,7 +1064,7 @@ class Trainer(object):
             self.model.perform_slowmo(
                 self.optimizer.optimizer, getattr(self.optimizer, "fp32_params", None)
             )
-        """==============打印==============="""
+        """==============6. 打印==============="""
         logging_output = None
         if not overflow or self.cfg.distributed_training.ddp_backend == "slowmo":
             self.set_num_updates(self.get_num_updates() + 1)
@@ -1171,9 +1177,8 @@ class Trainer(object):
         with torch.no_grad():
             self.model.eval()
             self.criterion.eval()
-
             sample, is_dummy_batch = self._prepare_sample(sample)
-            """======================run task.valid_step==============="""
+            """======================1. run task.valid_step==============="""
             try:
                 _loss, sample_size, logging_output = self.task.valid_step(
                     sample, self.model, self.criterion, **extra_kwargs
@@ -1208,7 +1213,7 @@ class Trainer(object):
                 ignore=is_dummy_batch,
             )
 
-        # log validation stats
+        """2. log validation stats"""
         if self.tpu:
             logging_outputs = self._xla_markstep_and_send_to_cpu(logging_outputs)
         logging_output = self._reduce_and_log_stats(logging_outputs, sample_size)
